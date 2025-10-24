@@ -1,0 +1,421 @@
+"""
+bank_marketing_project.py
+
+End-to-end pipeline for Bank Marketing classification mini-project:
+- Load dataset
+- EDA (plots saved)
+- Preprocessing (drop duration, handle 'unknown', encode, scale)
+- Baseline models (Logistic Regression, Decision Tree, Naive Bayes)
+- Advanced models (Random Forest, GradientBoosting)
+- Imbalance handling (class weights, optional SMOTE)
+- Hyperparameter tuning (GridSearchCV)
+- Evaluation (classification report, ROC, PR, confusion matrix)
+- Feature importances
+- Save best model, plots, and CSV summary
+- Simple Streamlit app generator
+
+Adjust PATHS / hyperparameters as needed.
+"""
+
+import os
+import json
+import pickle
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (classification_report, confusion_matrix, roc_auc_score,
+                             roc_curve, precision_recall_curve, average_precision_score)
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.naive_bayes import GaussianNB
+
+# Optional: SMOTE
+try:
+    from imblearn.over_sampling import SMOTE
+    IMBLEARN_AVAILABLE = True
+except Exception:
+    IMBLEARN_AVAILABLE = False
+
+# ---------- Configuration ----------
+DATA_PATH = "E:/Scripts/bank-marketing-dataset-full.csv"
+OUT_DIR = "E:/Scripts/bank_marketing_project_outputs"
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+CV_FOLDS = 3
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ---------- Utility functions ----------
+def savefig(fig, fname):
+    path = os.path.join(OUT_DIR, fname)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+def write_txt(fname, txt):
+    path = os.path.join(OUT_DIR, fname)
+    with open(path, "w") as f:
+        f.write(txt)
+    return path
+
+# ---------- Load & basic EDA ----------
+def load_data(path: str) -> pd.DataFrame:
+    # dataset uses semicolon separator according to UCI bank marketing format
+    df = pd.read_csv(path, sep=';')
+    return df
+
+def basic_eda(df: pd.DataFrame):
+    info = []
+    info.append(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+    target_counts = df['y'].value_counts()
+    info.append("Target counts:\n" + target_counts.to_string())
+    info.append("\nData types:\n" + df.dtypes.value_counts().to_string())
+    write_txt("basic_info.txt", "\n".join(info))
+
+    # target distribution plot
+    fig = plt.figure(figsize=(6,4))
+    sns.countplot(x='y', data=df)
+    plt.title("Target distribution (no / yes)")
+    savefig(fig, "target_distribution.png")
+
+    # age histogram
+    if 'age' in df.columns:
+        fig = plt.figure(figsize=(8,5))
+        sns.histplot(df['age'].dropna(), bins=30, kde=False)
+        plt.title("Age distribution")
+        savefig(fig, "age_distribution.png")
+
+    # job vs subscription rate (proportion yes)
+    if 'job' in df.columns:
+        rates = df.groupby('job')['y'].value_counts(normalize=True).unstack().fillna(0)
+        if 'yes' in rates.columns:
+            fig = plt.figure(figsize=(10,5))
+            rates['yes'].sort_values(ascending=False).plot(kind='bar')
+            plt.title("Subscription rate by job (proportion yes)")
+            savefig(fig, "job_subscription_rate.png")
+
+    # correlation heatmap for numeric features
+    numeric_cols = df.select_dtypes(include=['int64','float64']).columns.tolist()
+    if len(numeric_cols) >= 2:
+        fig = plt.figure(figsize=(10,8))
+        sns.heatmap(df[numeric_cols].corr(), annot=False, cmap='coolwarm', fmt=".2f")
+        plt.title("Numeric feature correlations")
+        savefig(fig, "numeric_correlations.png")
+
+# ---------- Preprocessing ----------
+def preprocess(df: pd.DataFrame, drop_duration: bool=True) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
+    df = df.copy()
+    if drop_duration and 'duration' in df.columns:
+        # 'duration' is a data leak in this dataset (length of the call)
+        df.drop(columns=['duration'], inplace=True)
+
+    # map target to binary
+    df['y'] = df['y'].map({'no': 0, 'yes': 1})
+
+    # identify numeric and categorical
+    numeric_cols = df.select_dtypes(include=['int64','float64']).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c != 'y']  # exclude target
+    cat_cols = df.select_dtypes(include=['object']).columns.tolist()
+
+    # quick unknown counts for categorical vars (dataset uses 'unknown' string)
+    unknown_counts = {c: int(df[c].isin(['unknown']).sum()) for c in cat_cols}
+    write_txt("unknown_counts.txt", json.dumps(unknown_counts, indent=2))
+
+    X = df.drop(columns=['y'])
+    y = df['y']
+
+    return X, y, numeric_cols, cat_cols
+
+def build_preprocessor(numeric_cols: List[str], cat_cols: List[str]) -> ColumnTransformer:
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    categorical_transformer = Pipeline(steps=[
+        # replace 'unknown' or NA with 'missing'
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
+    preprocessor = ColumnTransformer(transformers=[
+        ('num', numeric_transformer, numeric_cols),
+        ('cat', categorical_transformer, cat_cols)
+    ], remainder='drop')
+    return preprocessor
+
+# ---------- Model training & eval helpers ----------
+def evaluate_model(pipe: Pipeline, X_test: pd.DataFrame, y_test: pd.Series, model_name: str) -> Dict:
+    y_pred = pipe.predict(X_test)
+    y_proba = None
+    if hasattr(pipe.named_steps['clf'], "predict_proba"):
+        y_proba = pipe.predict_proba(X_test)[:,1]
+
+    rep = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_proba) if y_proba is not None else None
+    ap = average_precision_score(y_test, y_proba) if y_proba is not None else None
+
+    # Save classification report & confusion matrix
+    write_txt(f"{model_name}_classification_report.txt", json.dumps(rep, indent=2))
+    np.savetxt(os.path.join(OUT_DIR, f"{model_name}_confusion_matrix.csv"), cm, fmt='%d', delimiter=',')
+
+    # ROC/PR curves if probabilities available
+    if y_proba is not None:
+        # ROC
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        fig = plt.figure(figsize=(6,5))
+        plt.plot(fpr, tpr, label=f"AUC={auc:.3f}")
+        plt.plot([0,1],[0,1],'--', linewidth=0.8)
+        plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate"); plt.title(f"ROC - {model_name}")
+        plt.legend()
+        savefig(fig, f"{model_name}_roc.png")
+
+        # Precision-Recall
+        precision, recall, _ = precision_recall_curve(y_test, y_proba)
+        fig = plt.figure(figsize=(6,5))
+        plt.plot(recall, precision, label=f"AP={ap:.3f}")
+        plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"Precision-Recall - {model_name}")
+        plt.legend()
+        savefig(fig, f"{model_name}_pr.png")
+
+    return {"report": rep, "confusion_matrix": cm.tolist(), "roc_auc": auc, "average_precision": ap}
+
+# ---------- Main pipeline ----------
+def run_pipeline(data_path=DATA_PATH, out_dir=OUT_DIR, use_smote=False):
+    print("Loading data...")
+    df = load_data(data_path)
+    print("Running basic EDA...")
+    basic_eda(df)
+
+    print("Preprocessing dataset...")
+    X, y, numeric_cols, cat_cols = preprocess(df, drop_duration=True)
+
+    # train-test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE,
+                                                        stratify=y, random_state=RANDOM_STATE)
+    print(f"Train shape: {X_train.shape}, Test shape: {X_test.shape}")
+
+    # preprocessor
+    preprocessor = build_preprocessor(numeric_cols, cat_cols)
+
+    # Optionally apply SMOTE inside pipeline / before fitting.
+    # We'll implement two strategies in this script:
+    # (A) class_weight='balanced' on classifiers
+    # (B) SMOTE oversampling applied to transformed numeric+onehot arrays (if imblearn available)
+    # First create baseline pipelines (no SMOTE) with class weights where applicable.
+
+    # Models definitions
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=1000, class_weight='balanced', random_state=RANDOM_STATE),
+    "DecisionTree": DecisionTreeClassifier(class_weight='balanced', random_state=RANDOM_STATE),
+    "GaussianNB": GaussianNB(),  # Works with scaled features
+    }
+
+    trained = {}
+    results = []
+
+    print("Training baseline models...")
+    for name, clf in models.items():
+        pipe = Pipeline(steps=[('preproc', preprocessor), ('clf', clf)])
+        pipe.fit(X_train, y_train)
+        info = evaluate_model(pipe, X_test, y_test, model_name=name)
+        trained[name] = pipe
+        results.append({"model": name, "roc_auc": info["roc_auc"], "ap": info["average_precision"], "report": info["report"]})
+
+    # Advanced models with small grid search
+    advanced_params = {}
+    rf = RandomForestClassifier(random_state=RANDOM_STATE, class_weight='balanced')
+    gb = GradientBoostingClassifier(random_state=RANDOM_STATE)
+
+    # Wrap into grid search pipelines
+    print("Tuning advanced models via GridSearchCV (small grids)...")
+    rf_pipe = Pipeline(steps=[('preproc', preprocessor), ('clf', rf)])
+    rf_grid = {
+        'clf__n_estimators': [100],
+        'clf__max_depth': [8, 12]
+    }
+    rf_gs = GridSearchCV(rf_pipe, param_grid=rf_grid, scoring='f1', cv=StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+                         n_jobs=-1, verbose=0)
+    rf_gs.fit(X_train, y_train)
+    best_rf = rf_gs.best_estimator_
+    info_rf = evaluate_model(best_rf, X_test, y_test, model_name="RandomForest")
+    trained["RandomForest"] = best_rf
+    results.append({"model": "RandomForest", "best_params": rf_gs.best_params_, "roc_auc": info_rf["roc_auc"], "ap": info_rf["average_precision"], "report": info_rf["report"]})
+
+    # Gradient Boosting
+    gb_pipe = Pipeline(steps=[('preproc', preprocessor), ('clf', gb)])
+    gb_grid = {
+        'clf__n_estimators': [100],
+        'clf__learning_rate': [0.1, 0.05]
+    }
+    gb_gs = GridSearchCV(gb_pipe, param_grid=gb_grid, scoring='f1', cv=StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+                         n_jobs=-1, verbose=0)
+    gb_gs.fit(X_train, y_train)
+    best_gb = gb_gs.best_estimator_
+    info_gb = evaluate_model(best_gb, X_test, y_test, model_name="GradientBoosting")
+    trained["GradientBoosting"] = best_gb
+    results.append({"model": "GradientBoosting", "best_params": gb_gs.best_params_, "roc_auc": info_gb["roc_auc"], "ap": info_gb["average_precision"], "report": info_gb["report"]})
+
+    # Save model comparison
+    comp_rows = []
+    for r in results:
+        report = r.get('report', {})
+        pr_yes = None
+        rec_yes = None
+        f1_yes = None
+        if isinstance(report, dict) and '1' in report:
+            pr_yes = report['1'].get('precision')
+            rec_yes = report['1'].get('recall')
+            f1_yes = report['1'].get('f1-score')
+        comp_rows.append({
+            'model': r['model'],
+            'precision_yes': pr_yes,
+            'recall_yes': rec_yes,
+            'f1_yes': f1_yes,
+            'roc_auc': r.get('roc_auc'),
+            'average_precision': r.get('ap'),
+            'best_params': r.get('best_params', {})
+        })
+    pd.DataFrame(comp_rows).to_csv(os.path.join(OUT_DIR, "model_comparison.csv"), index=False)
+
+    # Feature importance using RandomForest (approx. with one-hot names)
+    if "RandomForest" in trained:
+        rf_model = trained["RandomForest"]
+        # Get feature names from preprocessor
+        # numeric cols + onehot output names
+        num_features = numeric_cols
+        ohe = rf_model.named_steps['preproc'].named_transformers_['cat'].named_steps['onehot']
+        try:
+            ohe_feature_names = list(ohe.get_feature_names_out(cat_cols))
+        except Exception:
+            # older sklearn versions
+            ohe_feature_names = []
+        feature_names = num_features + ohe_feature_names
+        importances = rf_model.named_steps['clf'].feature_importances_
+        feat_imp = pd.Series(importances, index=feature_names).sort_values(ascending=False)
+        feat_imp.head(30).to_csv(os.path.join(OUT_DIR, "feature_importances_top30.csv"))
+        # barplot
+        fig = plt.figure(figsize=(8,6))
+        feat_imp.head(15).sort_values().plot(kind='barh')
+        plt.title("Top 15 Feature Importances (RandomForest)")
+        savefig(fig, "feature_importances.png")
+
+    # Choose best model by ROC-AUC if available else by F1 from the comparison table
+    comp_df = pd.DataFrame(comp_rows)
+    # prefer roc_auc
+    if comp_df['roc_auc'].notnull().any():
+        best_row = comp_df.sort_values('roc_auc', ascending=False).iloc[0]
+    else:
+        best_row = comp_df.sort_values('f1_yes', ascending=False).iloc[0]
+    best_model_name = best_row['model']
+    best_model_pipe = trained[best_model_name]
+
+    # Save best model pickle
+    with open(os.path.join(OUT_DIR, "best_model.pkl"), "wb") as f:
+        pickle.dump(best_model_pipe, f)
+
+    # Save a short markdown report (2-4 pages worth in plain text)
+    report_md = []
+    report_md.append("# Bank Marketing — Mini Project Report")
+    report_md.append("")
+    report_md.append("**Problem & Objective**")
+    report_md.append("Predict whether a customer subscribes to a term deposit (binary classification).")
+    report_md.append("")
+    report_md.append("**Evaluation metrics chosen**")
+    report_md.append("- Priority: F1-score for positive class (yes), ROC-AUC, Average Precision (AP).")
+    report_md.append("")
+    report_md.append("**Dataset summary**")
+    report_md.append(f"- Rows: {df.shape[0]} | Columns: {df.shape[1]}")
+    report_md.append("")
+    report_md.append("**Preprocessing summary**")
+    report_md.append("- Dropped 'duration' column to avoid label leakage.")
+    report_md.append("- Categorical variables: imputed 'missing' and One-Hot encoded.")
+    report_md.append("- Numeric variables: median imputation + standard scaling.")
+    report_md.append("")
+    report_md.append("**Models tried**")
+    for r in comp_rows:
+        report_md.append(f"- {r['model']}: precision_yes={r['precision_yes']}, recall_yes={r['recall_yes']}, f1_yes={r['f1_yes']}, roc_auc={r['roc_auc']}")
+    report_md.append("")
+    report_md.append(f"**Selected best model**: {best_model_name}")
+    report_md.append("")
+    report_md.append("**Files saved**: model_comparison.csv, feature_importances_top30.csv, best_model.pkl, various plots.")
+    report_text = "\n".join(report_md)
+    write_txt("project_report.md", report_text)
+
+    print("Pipeline finished. Outputs saved to:", out_dir)
+    return trained, comp_df, best_model_name
+
+# ---------- Optional: Streamlit app generator ----------
+def write_streamlit_app(df: pd.DataFrame, model_path: str, out_dir: str = OUT_DIR, n_features:int=8):
+    """
+    Generate a simple Streamlit app file streamlit_app.py that:
+     - loads the saved model pickle (model_path)
+     - asks user for a small set of important features (we take a handful from df)
+     - returns predicted probability and binary prediction (threshold 0.5)
+    """
+    # choose a few categorical features and numeric ones to show in app
+    # pick common features available in dataset
+    defaults = {}
+    for c in ['job','marital','education','default','housing','loan','contact']:
+        if c in df.columns:
+            defaults[c] = sorted(df[c].dropna().unique().tolist())
+    numeric_defaults = {}
+    for c in ['age','emp.var.rate','euribor3m','cons.price.idx']:
+        if c in df.columns:
+            numeric_defaults[c] = float(df[c].median())
+
+    # build code string
+    app_code = f"""import streamlit as st
+import pandas as pd
+import pickle
+
+model = pickle.load(open(r'{model_path}', 'rb'))
+st.title("Bank Marketing — Term Deposit Subscription Predictor (Demo)")
+st.write("Provide customer details and get predicted probability of subscription.")
+
+# Categorical inputs
+"""
+    for c, vals in defaults.items():
+        app_code += f"{c} = st.selectbox('{c}', {repr(vals)})\n"
+
+    app_code += "\n# Numeric inputs\n"
+    for c, med in numeric_defaults.items():
+        app_code += f"{c} = st.number_input('{c}', value={med})\n"
+
+    # Build input dataframe generation
+    app_code += "\nif st.button('Predict'):\n"
+    app_code += "    input_df = pd.DataFrame([{\n"
+    # include only those features we captured
+    for c in list(defaults.keys()) + list(numeric_defaults.keys()):
+        app_code += f"        '{c}': {c},\n"
+    app_code += "    }])\n"
+    app_code += "    prob = model.predict_proba(input_df)[0][1]\n"
+    app_code += "    st.write(f'Predicted probability of subscription: {prob:.3f}')\n"
+    app_code += "    st.write('Prediction (threshold 0.5):', 'yes' if prob>=0.5 else 'no')\n"
+
+    app_path = os.path.join(out_dir, "streamlit_app.py")
+    with open(app_path, "w") as f:
+        f.write(app_code)
+    print("Streamlit app saved to:", app_path)
+    return app_path
+
+# ---------- If run directly ----------
+if __name__ == "__main__":
+    trained_models, comparison_df, best_name = run_pipeline()
+    # Load original dataset for streamlit app generation
+    df_orig = load_data(DATA_PATH)
+    write_streamlit_app(df_orig, os.path.join(OUT_DIR, "best_model.pkl"))
+
+    print("Best model:", best_name)
+    print("Created files (snippet):")
+    print("\n".join(os.listdir(OUT_DIR)[:50]))
